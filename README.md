@@ -294,7 +294,7 @@ fn main() -> i32 {
 
 ### Hardware Performance Counter Programs
 
-Use `@perf_event` to attach eBPF programs to hardware or software performance counters. `perf_options` keeps the kernel's tagged `perf_type + perf_config` model, so adding new perf event families does not require flattening everything into one enum. Only `perf_type` and `perf_config` are required; all other fields have sensible defaults. Perf attaches return a first-class attachment value, so if you need the current count in userspace, call `read(att)`:
+Use `@perf_event` to attach eBPF programs to hardware or software performance counters. `perf_options` keeps the kernel's tagged `perf_type + perf_config` model, so adding new perf event families does not require flattening everything into one enum. Only `perf_type` and `perf_config` are required; all other fields have sensible defaults. Perf attaches return a first-class attachment value, so if you need the current count in userspace, call `read(att).scaled`:
 
 ```kernelscript
 // eBPF program fires on every hardware branch-miss sample
@@ -306,10 +306,10 @@ fn on_branch_miss(ctx: *bpf_perf_event_data) -> i32 {
 fn main() -> i32 {
     var prog = load(on_branch_miss)
 
-    // Minimal form — defaults: pid=-1 (all procs), cpu=0,
+    // Minimal form — defaults: pid=-1 (all procs), cpu=0, no group,
     // period=1_000_000, wakeup=1; perf attach flags must be 0
     var att = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses }, 0)
-    var count = read(att)
+    var count = read(att).scaled
     print("branch misses: %lld", count)
 
     detach(att)    // disables counter, destroys BPF link, closes fd
@@ -317,6 +317,22 @@ fn main() -> i32 {
     return 0
 }
 ```
+
+Perf events can share a kernel scheduling group by passing the leader attachment directly with `group`.
+The lower-level `group_fd: cache.perf_fd` form is still supported for compatibility:
+
+```kernelscript
+var cache = attach(prog, perf_options { perf_type: perf_type_hardware, perf_config: cache_misses }, 0)
+var branch = attach(prog, perf_options {
+    perf_type: perf_type_hardware,
+    perf_config: branch_misses,
+    group: cache,
+}, 0)
+```
+
+Adding a member restarts the whole group from zero. Detaching a leader cascades to any live members. A group competes for PMU counters as one atomic unit: different groups can be multiplexed over time, but members inside one group are not independently multiplexed. For statically visible groups, the compiler rejects groups that need more PMU counter slots than the target limit. The limit is read from known sysfs PMU caps when available, defaults to 4, can be overridden with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS`, and is capped at 16 to match `PerfRead`.
+
+`read(att)` returns a `PerfRead` snapshot with raw, multiplex-scaled, timing, and group fields. Use `read(att).scaled` for that attachment's counter value, `read(att).raw` for its unscaled value, and `read(att).values` / `read(att).ids` for a same-time group snapshot.
 
 **Available `perf_type` values:**
 

@@ -109,6 +109,22 @@ let validate_register_function arg_types ast_context _pos =
     | _ -> 
         (false, Some "register() requires an impl block argument")
 
+(** Read dispatch metadata keyed by argument type.
+    This keeps read() trait-shaped even while only PerfAttachment is supported. *)
+type read_dispatch = {
+  read_return_type: bpf_type;
+  read_userspace_impl: string;
+}
+
+let read_dispatch_for_type = function
+  | Struct "PerfAttachment"
+  | UserType "PerfAttachment" ->
+      Some {
+        read_return_type = Struct "PerfRead";
+        read_userspace_impl = "ks_perf_attachment_read";
+      }
+  | _ -> None
+
 (** Validation function for attach() - accepts standard 3-arg form, and perf_options 3-arg form *)
 let validate_attach_function arg_types _ast_context _pos =
   match arg_types with
@@ -124,10 +140,12 @@ let validate_attach_function arg_types _ast_context _pos =
 (** Validation function for read() - currently only accepts perf attachment values *)
 let validate_read_function arg_types _ast_context _pos =
   match arg_types with
-  | [Struct "PerfAttachment"] | [UserType "PerfAttachment"] ->
-      (true, None)
+  | [arg_type] ->
+      (match read_dispatch_for_type arg_type with
+       | Some _ -> (true, None)
+       | None -> (false, Some "read() currently requires a PerfAttachment"))
   | _ ->
-      (false, Some "read() currently requires a PerfAttachment")
+      (false, Some "read() currently requires exactly one argument")
 
 (** Validation function for detach() - accepts program handles and perf attachments *)
 let validate_detach_function arg_types _ast_context _pos =
@@ -243,8 +261,8 @@ let builtin_functions = [
   {
     name = "read";
     param_types = []; (* Custom validation handles attachment-aware overloads *)
-    return_type = I64; (* Raw counter value, or -1 on error *)
-    description = "Read the current hardware/software counter value for a perf attachment";
+    return_type = Struct "PerfRead";
+    description = "Read raw/scaled/timing values and group snapshot arrays for a perf attachment";
     is_variadic = false;
     ebpf_impl = ""; (* Not available in eBPF context *)
     userspace_impl = "ks_perf_attachment_read";
@@ -290,6 +308,8 @@ let get_kernel_implementation name =
 
 (** Builtin type definitions *)
 let builtin_pos = { line = 0; column = 0; filename = "<builtin>" }
+
+let perf_read_max_values = 16
 
 let builtin_types = [
   (* Standard C types as type aliases *)
@@ -349,6 +369,8 @@ let builtin_types = [
     ("perf_config",    U64);
     ("pid",            I32);
     ("cpu",            I32);
+    ("group_fd",       I32);
+    ("group",          Struct "PerfAttachment");
     ("period",         U64);
     ("wakeup",         U32);
     ("inherit",        Bool);
@@ -363,6 +385,16 @@ let builtin_types = [
     ("prog_fd", I32);
     ("generation", U64);
   ], builtin_pos));
+
+  TypeDef (StructDef ("PerfRead", [
+    ("raw", I64);
+    ("scaled", I64);
+    ("time_enabled", U64);
+    ("time_running", U64);
+    ("count", U32);
+    ("values", Array (I64, perf_read_max_values));
+    ("ids", Array (U64, perf_read_max_values));
+  ], builtin_pos));
 ]
 
 (** Default field values for structs that support partial initialisation.
@@ -372,13 +404,20 @@ let builtin_types = [
 let get_struct_field_defaults = function
   | "perf_options" ->
       Some [
-        ("pid",            IntLit (Signed64 (-1L),      None));
-        ("cpu",            IntLit (Signed64 0L,         None));
-        ("period",         IntLit (Unsigned64 1000000L, None));
-        ("wakeup",         IntLit (Unsigned64 1L,       None));
-        ("inherit",        BoolLit false);
-        ("exclude_kernel", BoolLit false);
-        ("exclude_user",   BoolLit false);
+        ("pid",            Literal (IntLit (Signed64 (-1L),      None)));
+        ("cpu",            Literal (IntLit (Signed64 0L,         None)));
+        ("group_fd",       Literal (IntLit (Signed64 (-1L),      None)));
+        ("group",          StructLiteral ("PerfAttachment", [
+          ("perf_fd",    make_expr (Literal (IntLit (Signed64 (-1L), None))) builtin_pos);
+          ("link_id",    make_expr (Literal (IntLit (Signed64 (-1L), None))) builtin_pos);
+          ("prog_fd",    make_expr (Literal (IntLit (Signed64 (-1L), None))) builtin_pos);
+          ("generation", make_expr (Literal (IntLit (Unsigned64 0L,  None))) builtin_pos);
+        ]));
+        ("period",         Literal (IntLit (Unsigned64 1000000L, None)));
+        ("wakeup",         Literal (IntLit (Unsigned64 1L,       None)));
+        ("inherit",        Literal (BoolLit false));
+        ("exclude_kernel", Literal (BoolLit false));
+        ("exclude_user",   Literal (BoolLit false));
       ]
   | _ -> None
 

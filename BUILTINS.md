@@ -98,7 +98,7 @@ fn main() -> i32 {
     - `flags`: Attachment flags (context-dependent)
 - Perf event form:
     - `handle`: Program handle returned from `load()`
-    - `opts`: `perf_options` value — only `perf_type` and `perf_config` are required; all other fields have defaults
+    - `opts`: `perf_options` value — only `perf_type` and `perf_config` are required; all other fields have defaults, including no group (`group` invalid and `group_fd=-1`)
     - `flags`: Must be `0` for perf attaches; nonzero values are rejected
 
 **Return Value:**
@@ -117,10 +117,22 @@ if (result != 0) {
 // pid=-1 (all procs), cpu=0, period=1_000_000, wakeup=1; perf attach flags must be 0
 var perf_prog = load(on_branch_miss)
 var perf_att = attach(perf_prog, perf_options { perf_type: perf_type_hardware, perf_config: branch_misses }, 0)
-var count = read(perf_att)
+var count = read(perf_att).scaled
 detach(perf_att)
 detach(perf_prog)
+
+// Grouped perf events: branch joins cache's leader group. Adding a member restarts the group.
+var cache = attach(perf_prog, perf_options { perf_type: perf_type_hardware, perf_config: cache_misses }, 0)
+var branch = attach(perf_prog, perf_options {
+    perf_type: perf_type_hardware,
+    perf_config: branch_misses,
+    group: cache,
+}, 0)
+detach(branch)
+detach(cache)
 ```
+
+Grouped events are scheduled as one atomic PMU unit. Separate events and separate groups may be multiplexed, but members inside one group cannot be independently multiplexed. Static groups that exceed the target PMU counter limit are rejected at compile time; override the detected/default limit with `KERNELSCRIPT_PERF_GROUP_MAX_EVENTS` when compiling for a different target. The effective limit is capped at 16 to match `PerfRead`.
 
 **Context-specific implementations:**
 - **eBPF:** Not available
@@ -159,18 +171,23 @@ detach(prog)  // Clean up
 ---
 
 #### `read(handle)`
-**Signature:** `read(handle: PerfAttachment) -> i64`
+**Signature:** `read(handle: PerfAttachment) -> PerfRead`
 **Variadic:** No
 **Context:** Userspace only
 
-**Description:** Read the current hardware/software counter value from a perf attachment.
+**Description:** Read a perf attachment snapshot. The result includes this attachment's raw and scaled count, multiplex timing, and same-time group arrays.
 
 **Parameters:**
 - `handle`: Perf attachment returned from `attach(handle, perf_options, flags)`
 
 **Return Value:**
-- Returns the raw 64-bit counter value on success
-- Returns `-1` on invalid/stale attachment or read failure
+- `raw`: this event's unscaled counter value, or `-1` on invalid/stale attachment or read failure
+- `scaled`: this event's multiplex-corrected value, or `-1` on timing/read error
+- `time_enabled`: perf enabled time
+- `time_running`: perf running time
+- `count`: number of group entries returned; `1` for a standalone event
+- `values`: multiplex-scaled group values, capped at 16; `values[0] == scaled`
+- `ids`: perf event IDs for the returned values
 - Reads use the attachment's `perf_fd` directly; the internal token detects copied handles used after detach.
 
 ---
