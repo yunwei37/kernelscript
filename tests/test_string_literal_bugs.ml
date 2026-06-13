@@ -342,6 +342,27 @@ let test_edge_cases_for_bugs () =
   Alcotest.(check bool) "Empty string: Does NOT use .data field for print" 
     false (contains_substr output3 "str_lit_1.data")
 
+(**
+ * Bug Fix Test 10: eBPF String Compare Helper Rejection
+ *
+ * ISSUE: bpf_strncmp rejected stack-backed string literals on recent verifiers.
+ * FIX: Generate a bounded unrolled comparison loop instead of helper call.
+ *)
+let test_string_compare_avoids_bpf_strncmp () =
+  let ctx = create_c_context () in
+  let left_val = make_ir_value (IRVariable "name") (IRStr 16) test_pos in
+  let right_val = make_ir_value (IRLiteral (StringLit "hello")) (IRStr 5) test_pos in
+  let compare_expr = generate_string_compare ctx left_val right_val true in
+  emit_line ctx ("__u8 result = " ^ compare_expr ^ ";");
+  let output = String.concat "\n" ctx.output_lines in
+
+  Alcotest.(check bool) "String compare should not call bpf_strncmp"
+    false (contains_substr output "bpf_strncmp");
+  Alcotest.(check bool) "String compare should generate equality temporary"
+    true (contains_substr output "__u8 str_eq_");
+  Alcotest.(check bool) "String compare should be unrolled"
+    true (contains_substr output "#pragma unroll")
+
 (** Test suite for string literal bug fixes *)
 let bug_fix_suite =
   [
@@ -354,10 +375,11 @@ let bug_fix_suite =
     ("Bug Fix: String concat loop bounds", `Quick, test_string_concat_loop_bounds_bug);
     ("Integration: Combined bugs", `Quick, test_combined_bugs_integration);
     ("Edge cases for bugs", `Quick, test_edge_cases_for_bugs);
+    ("Bug Fix: String compare avoids bpf_strncmp", `Quick, test_string_compare_avoids_bpf_strncmp);
   ]
 
 (** Run the bug fix tests *)
 let () =
   Alcotest.run "String Literal Bug Fixes" [
     ("string_literal_bugs", bug_fix_suite);
-  ] 
+  ]

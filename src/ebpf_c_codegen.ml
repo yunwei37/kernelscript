@@ -140,6 +140,10 @@ type c_context = {
   mutable current_function_context_type: string option;
   (* Track dynptr-backed pointers for proper field assignment *)
   mutable dynptr_backed_pointers: (string, string) Hashtbl.t; (* pointer_var -> dynptr_var *)
+  (* Track the verifier-visible flag proving a dynptr reserve is live. *)
+  mutable dynptr_reserved_flags: (string, string) Hashtbl.t; (* pointer_var -> reserved_flag *)
+  (* Track pointers derived from XDP packet data so dereferences get data_end guards. *)
+  mutable packet_data_pointers: (string, unit) Hashtbl.t;
 }
 
 let create_c_context () = {
@@ -161,6 +165,8 @@ let create_c_context () = {
   declared_registers = Hashtbl.create 32;
   current_function_context_type = None;
   dynptr_backed_pointers = Hashtbl.create 32;
+  dynptr_reserved_flags = Hashtbl.create 32;
+  packet_data_pointers = Hashtbl.create 32;
 }
 
 (** Get the appropriate fallback return value when bpf_tail_call() fails.
@@ -1407,23 +1413,34 @@ let generate_string_concat ctx left_val right_val =
   temp_var
 
 let generate_string_compare ctx left_val right_val is_equal =
-  (* Use bpf_strncmp() helper for efficient string comparison *)
+  (* Avoid bpf_strncmp for stack-backed strings: recent verifiers restrict the
+     third helper argument more tightly than ordinary stack memory. *)
   let left_str = generate_c_value ctx left_val in
   let right_str = generate_c_value ctx right_val in
   
-  (* Extract size from left string type for bpf_strncmp bounds *)
-  let left_size = match left_val.val_type with
-    | IRStr size -> size
-    | _ -> failwith "String compare called on non-string type"
+  let (left_size, right_size) = match left_val.val_type, right_val.val_type with
+    | IRStr ls, IRStr rs -> (ls, rs)
+    | _ -> failwith "String compare called on non-string types"
   in
   
-  (* Generate bpf_strncmp() call - returns 0 if strings are equal *)
-  let cmp_result = sprintf "bpf_strncmp(%s.data, %d, %s.data)" left_str left_size right_str in
+  let cmp_var = fresh_var ctx "str_eq" in
+  let left_ch = fresh_var ctx "str_left_ch" in
+  let right_ch = fresh_var ctx "str_right_ch" in
+  let max_size = max left_size right_size in
+
+  emit_line ctx (sprintf "__u8 %s = 1;" cmp_var);
+  emit_line ctx "#pragma unroll";
+  emit_line ctx (sprintf "for (int i = 0; i < %d; i++) {" max_size);
+  emit_line ctx (sprintf "    char %s = (i < %d) ? %s.data[i] : 0;" left_ch left_size left_str);
+  emit_line ctx (sprintf "    char %s = (i < %d) ? %s.data[i] : 0;" right_ch right_size right_str);
+  emit_line ctx (sprintf "    if (%s != %s) { %s = 0; break; }" left_ch right_ch cmp_var);
+  emit_line ctx (sprintf "    if (%s == 0 && %s == 0) break;" left_ch right_ch);
+  emit_line ctx "}";
   
   if is_equal then
-    sprintf "(%s == 0)" cmp_result  (* Equal if bpf_strncmp returns 0 *)
+    cmp_var
   else
-    sprintf "(%s != 0)" cmp_result  (* Not equal if bpf_strncmp returns non-zero *)
+    sprintf "(!%s)" cmp_var
 
 (** Generate C expression from IR expression *)
 
@@ -1537,6 +1554,22 @@ let generate_c_expression ctx ir_expr =
            let val_str = (match ir_val.value_desc with
              | IRMapAccess (_, _, _) -> generate_c_value ~auto_deref_map_access:true ctx ir_val
              | _ -> generate_c_value ctx ir_val) in
+           if ctx.current_function_context_type = Some "xdp" &&
+              Hashtbl.mem ctx.packet_data_pointers val_str then
+             (match ir_val.val_type with
+              | IRPointer (inner_type, _) ->
+                  let c_type = ebpf_type_from_ir_type inner_type in
+                  let size = match inner_type with
+                    | IRI8 | IRU8 | IRChar | IRBool -> 1
+                    | IRI16 | IRU16 -> 2
+                    | IRI32 | IRU32 | IRF32 -> 4
+                    | IRI64 | IRU64 | IRF64 -> 8
+                    | _ -> 4
+                  in
+                  sprintf "({ %s __pkt_val = 0; void *__data_end = (void*)(long)ctx->data_end; if ((void*)%s + %d <= __data_end) { __pkt_val = *(%s*)%s; } __pkt_val; })"
+                    c_type val_str size c_type val_str
+              | _ -> sprintf "SAFE_DEREF(%s)" val_str)
+           else
            (match detect_memory_region_enhanced ir_val with
             | PacketData ->
                 (* Packet data - use bpf_dynptr_from_xdp *)
@@ -1802,6 +1835,7 @@ let generate_c_expression ctx ir_expr =
 let rec generate_c_function ctx ir_func =
   (* Clear per-function state to avoid conflicts between functions *)
   Hashtbl.clear ctx.declared_registers;
+  Hashtbl.clear ctx.packet_data_pointers;
   
   (* Determine current function's context type from first parameter or program type *)
   ctx.current_function_context_type <- 
@@ -2213,6 +2247,8 @@ and generate_c_instruction ctx ir_instr =
       let access_str = Kernelscript_context.Context_codegen.generate_context_field_access context_type "ctx" field_name in
       (* Simple assignment - register already declared at function level *)
       let dest_str = generate_c_value ctx dest_val in
+      if context_type = "xdp" && field_name = "data" then
+        Hashtbl.replace ctx.packet_data_pointers dest_str ();
       emit_line ctx (sprintf "%s = %s;" dest_str access_str)
 
   | IRBoundsCheck (value_val, min_bound, max_bound) ->
@@ -2539,7 +2575,7 @@ and generate_c_instruction ctx ir_instr =
   | IRObjectDelete ptr_val ->
       let ptr_str = generate_c_value ctx ptr_val in
       (* Use the proper kernel bpf_obj_drop(ptr) macro *)
-      emit_line ctx (sprintf "bpf_obj_drop(%s);" ptr_str)
+      emit_line ctx (sprintf "if (%s) bpf_obj_drop(%s);" ptr_str ptr_str)
 
 (** Generate C code for basic block *)
 and generate_c_basic_block ctx ir_block =
@@ -2612,8 +2648,13 @@ and generate_assignment ctx dest_val expr is_const =
               (match Hashtbl.find_opt ctx.dynptr_backed_pointers src_str with
                | Some dynptr_var ->
                    (* Source is dynptr-backed, mark destination as dynptr-backed too *)
-                   Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var
-               | None -> ())
+                   Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var;
+                   (match Hashtbl.find_opt ctx.dynptr_reserved_flags src_str with
+                    | Some flag_var -> Hashtbl.replace ctx.dynptr_reserved_flags dest_str flag_var
+                    | None -> ())
+               | None -> ());
+              if Hashtbl.mem ctx.packet_data_pointers src_str then
+                Hashtbl.replace ctx.packet_data_pointers dest_str ()
           | _ -> ());
 
          (* Cross-size string assignments need length-respecting field copy
@@ -2636,8 +2677,13 @@ and generate_assignment ctx dest_val expr is_const =
             (match Hashtbl.find_opt ctx.dynptr_backed_pointers src_str with
              | Some dynptr_var ->
                  (* Source is dynptr-backed, mark destination as dynptr-backed too *)
-                 Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var
-             | None -> ())
+                 Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var;
+                 (match Hashtbl.find_opt ctx.dynptr_reserved_flags src_str with
+                  | Some flag_var -> Hashtbl.replace ctx.dynptr_reserved_flags dest_str flag_var
+                  | None -> ())
+             | None -> ());
+            if Hashtbl.mem ctx.packet_data_pointers src_str then
+              Hashtbl.replace ctx.packet_data_pointers dest_str ()
         | _ -> ());
        
        (* Check if this is a string assignment *)
@@ -2871,7 +2917,9 @@ and generate_ringbuf_operation ctx ringbuf_val op =
       
       (* Declare dynptr variable *)
       let dynptr_var = result_var_name ^ "_dynptr" in
+      let reserved_flag = result_var_name ^ "_reserved" in
       emit_line ctx (sprintf "struct bpf_dynptr %s;" dynptr_var);
+      emit_line ctx (sprintf "__u8 %s = 0;" reserved_flag);
       
       (* The data pointer variable will be declared by the function's register collection phase *)
       
@@ -2881,13 +2929,20 @@ and generate_ringbuf_operation ctx ringbuf_val op =
       (* Get data pointer from dynptr *)
       emit_line ctx (sprintf "    %s = bpf_dynptr_data(&%s, 0, %s);" 
                      result_str dynptr_var size);
+      emit_line ctx (sprintf "    if (%s) {" result_str);
+      emit_line ctx (sprintf "        %s = 1;" reserved_flag);
+      emit_line ctx "    } else {";
+      emit_line ctx (sprintf "        bpf_ringbuf_discard_dynptr(&%s, 0);" dynptr_var);
+      emit_line ctx "    }";
       
       emit_line ctx (sprintf "} else {");
       emit_line ctx (sprintf "    %s = NULL;" result_str);
+      emit_line ctx (sprintf "    bpf_ringbuf_discard_dynptr(&%s, 0);" dynptr_var);
       emit_line ctx (sprintf "}");
       
       (* Track this pointer as dynptr-backed *)
-      Hashtbl.replace ctx.dynptr_backed_pointers result_str dynptr_var
+      Hashtbl.replace ctx.dynptr_backed_pointers result_str dynptr_var;
+      Hashtbl.replace ctx.dynptr_reserved_flags result_str reserved_flag
       
   | RingbufSubmit data_ptr ->
       let data_str = generate_c_value ctx data_ptr in
@@ -2895,14 +2950,24 @@ and generate_ringbuf_operation ctx ringbuf_val op =
         | Some dv -> dv
         | None -> data_str ^ "_dynptr"
       in
-      emit_line ctx (sprintf "if (%s) bpf_ringbuf_submit_dynptr(&%s, 0);" data_str dynptr_var)
+      let reserved_flag = match Hashtbl.find_opt ctx.dynptr_reserved_flags data_str with
+        | Some flag -> flag
+        | None -> data_str ^ "_reserved"
+      in
+      emit_line ctx (sprintf "if (%s) { bpf_ringbuf_submit_dynptr(&%s, 0); %s = 0; }"
+                       reserved_flag dynptr_var reserved_flag)
   | RingbufDiscard data_ptr ->
       let data_str = generate_c_value ctx data_ptr in
       let dynptr_var = match Hashtbl.find_opt ctx.dynptr_backed_pointers data_str with
         | Some dv -> dv
         | None -> data_str ^ "_dynptr"
       in
-      emit_line ctx (sprintf "if (%s) bpf_ringbuf_discard_dynptr(&%s, 0);" data_str dynptr_var)
+      let reserved_flag = match Hashtbl.find_opt ctx.dynptr_reserved_flags data_str with
+        | Some flag -> flag
+        | None -> data_str ^ "_reserved"
+      in
+      emit_line ctx (sprintf "if (%s) { bpf_ringbuf_discard_dynptr(&%s, 0); %s = 0; }"
+                       reserved_flag dynptr_var reserved_flag)
   | RingbufOnEvent _handler_name ->
       (* Ring buffer on_event() is userspace-only *)
       failwith "Ring buffer on_event() operation is not supported in eBPF programs - it's userspace-only"
@@ -3166,8 +3231,13 @@ let generate_assignment ctx dest_val expr is_const =
               (match Hashtbl.find_opt ctx.dynptr_backed_pointers src_str with
                | Some dynptr_var ->
                    (* Source is dynptr-backed, mark destination as dynptr-backed too *)
-                   Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var
-               | None -> ())
+                   Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var;
+                   (match Hashtbl.find_opt ctx.dynptr_reserved_flags src_str with
+                    | Some flag_var -> Hashtbl.replace ctx.dynptr_reserved_flags dest_str flag_var
+                    | None -> ())
+               | None -> ());
+              if Hashtbl.mem ctx.packet_data_pointers src_str then
+                Hashtbl.replace ctx.packet_data_pointers dest_str ()
           | _ -> ());
 
          (* Cross-size string assignments need length-respecting field copy
@@ -3190,8 +3260,13 @@ let generate_assignment ctx dest_val expr is_const =
             (match Hashtbl.find_opt ctx.dynptr_backed_pointers src_str with
              | Some dynptr_var ->
                  (* Source is dynptr-backed, mark destination as dynptr-backed too *)
-                 Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var
-             | None -> ())
+                 Hashtbl.replace ctx.dynptr_backed_pointers dest_str dynptr_var;
+                 (match Hashtbl.find_opt ctx.dynptr_reserved_flags src_str with
+                  | Some flag_var -> Hashtbl.replace ctx.dynptr_reserved_flags dest_str flag_var
+                  | None -> ())
+             | None -> ());
+            if Hashtbl.mem ctx.packet_data_pointers src_str then
+              Hashtbl.replace ctx.packet_data_pointers dest_str ()
         | _ -> ());
        
        (* Check if this is a string assignment *)

@@ -387,8 +387,16 @@ fn main() -> i32 { return 0 }
     let c_code = generate_ebpf_c ir_prog in
     check bool "eBPF C code should contain bpf_ringbuf_reserve_dynptr" true 
       (contains_substr c_code "bpf_ringbuf_reserve_dynptr");
+    check bool "eBPF C code should track a live reserve flag" true
+      (contains_substr c_code "__u8 __ringbuf_reserve_0_reserved = 0;");
+    check bool "eBPF C code should discard if dynptr data is unavailable" true
+      (contains_substr c_code "bpf_ringbuf_discard_dynptr(&__ringbuf_reserve_0_dynptr, 0);");
+    check bool "eBPF C code should discard on reserve failure branch" true
+      (contains_substr c_code "__ringbuf_reserve_0 = NULL;\n        bpf_ringbuf_discard_dynptr(&__ringbuf_reserve_0_dynptr, 0);");
     check bool "eBPF C code should contain bpf_ringbuf_submit_dynptr" true 
-      (contains_substr c_code "bpf_ringbuf_submit_dynptr")
+      (contains_substr c_code "bpf_ringbuf_submit_dynptr");
+    check bool "eBPF C code should submit based on reserve flag" true
+      (contains_substr c_code "if (__ringbuf_reserve_0_reserved) { bpf_ringbuf_submit_dynptr")
   ) else (
     check bool "Should have at least one eBPF program" false true
   )
@@ -1260,4 +1268,4 @@ let () =
       test_case "dispatch_used true emits combined_rb" `Quick test_handlers_dispatch_true_combined_rb;
       test_case "multiple ring buffers each get wrapper" `Quick test_handlers_multiple_ringbufs;
     ];
-  ] 
+  ]

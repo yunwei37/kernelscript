@@ -68,7 +68,7 @@
 (executable
  (name test_object_allocation)
  (modules test_object_allocation)
- (libraries kernelscript alcotest))
+ (libraries kernelscript alcotest test_utils str))
 
 (executable
  (name test_safety_checker)

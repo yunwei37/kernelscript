@@ -3,6 +3,12 @@ open Alcotest
 
 let pos = { line = 1; column = 1; filename = "test" }
 
+let contains_substr str substr =
+  try
+    let _ = Str.search_forward (Str.regexp_string substr) str 0 in
+    true
+  with Not_found -> false
+
 let make_expr desc = {
   expr_desc = desc;
   expr_pos = pos;
@@ -89,6 +95,34 @@ let test_variable_assignment_bug () =
   (* and our previous tests pass, then the variable assignment bug is fixed *)
   ()
 
+(** Test that eBPF object deletion is guarded for verifier-nullability. *)
+let test_ebpf_object_delete_null_guard_codegen () =
+  let program = {|
+struct TestData {
+  value: u64,
+}
+
+@xdp fn test_prog(ctx: *xdp_md) -> xdp_action {
+  var ptr = new TestData()
+  delete ptr
+  return XDP_PASS
+}
+
+fn main() -> i32 { return 0 }
+|} in
+  let ast = Kernelscript.Parse.parse_string program in
+  let symbol_table = Test_utils.Helpers.create_test_symbol_table ast in
+  let (typed_ast, _) =
+    Kernelscript.Type_checker.type_check_and_annotate_ast ~symbol_table:(Some symbol_table) ast
+  in
+  let ir_multi = Kernelscript.Ir_generator.generate_ir typed_ast symbol_table "test" in
+  let ir_prog = List.hd (Kernelscript.Ir.get_programs ir_multi) in
+  let c_code = Kernelscript.Ebpf_c_codegen.generate_c_program ir_prog in
+  check bool "bpf_obj_new should be generated" true
+    (contains_substr c_code "ptr = bpf_obj_new(struct TestData);");
+  check bool "bpf_obj_drop should be null guarded" true
+    (contains_substr c_code "if (ptr) bpf_obj_drop(ptr);")
+
 (** Test error cases *)
 let test_error_cases () =
   (* This should be caught during validation *)
@@ -102,7 +136,8 @@ let tests = [
   ("delete targets", `Quick, test_delete_targets);
   ("IR generation", `Quick, test_ir_generation);
   ("variable assignment bug fix", `Quick, test_variable_assignment_bug);
+  ("eBPF object delete null guard codegen", `Quick, test_ebpf_object_delete_null_guard_codegen);
   ("error cases", `Quick, test_error_cases);
 ]
 
-let () = run "Object Allocation Tests" [("main", tests)] 
+let () = run "Object Allocation Tests" [("main", tests)]

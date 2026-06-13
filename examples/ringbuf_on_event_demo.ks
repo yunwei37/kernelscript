@@ -26,8 +26,8 @@ var security_events : ringbuf<SecurityEvent>(8192)
   return XDP_PASS
 }
 
-@probe("sys_openat")
-fn security_monitor(dfd: i32, filename: *u8, flags: i32, mode: u16) -> i32 {
+@probe("do_sys_open")
+fn security_monitor(dfd: i32, filename: *u8, mode: i32, flags: i32) -> i32 {
   var reserved = security_events.reserve()
   security_events.submit(reserved)
   return 0
@@ -59,4 +59,4 @@ fn main() -> i32 {
   dispatch(network_events, security_events)
   
   return 0
-} 
+}

@@ -106,6 +106,32 @@ let test_context_field_arithmetic () =
   
   check bool "Should generate pointer arithmetic for context fields" true has_pointer_arithmetic
 
+let test_xdp_packet_deref_bounds_guard () =
+  let source = {|
+    @xdp fn test_packet_deref(ctx: *xdp_md) -> xdp_action {
+      var packet_byte = *ctx->data
+      if (packet_byte > 0) {
+        return XDP_PASS
+      }
+      return XDP_DROP
+    }
+  |} in
+
+  let ast = parse_string source in
+  let symbol_table = Helpers.create_test_symbol_table ~include_xdp:true ~include_tc:false ~include_struct_ops:false ast in
+  let (typed_ast, _) =
+    Kernelscript.Type_checker.type_check_and_annotate_ast ~symbol_table:(Some symbol_table) ast
+  in
+  let ir_program = Kernelscript.Ir_generator.generate_ir ~use_type_annotations:true typed_ast symbol_table "test" in
+  let (c_code, _) = Kernelscript.Ebpf_c_codegen.compile_multi_to_c ir_program in
+
+  check bool "Packet dereference should use ctx->data_end guard" true
+    (contains_substring c_code "ctx->data_end");
+  check bool "Packet dereference should bounds-check before reading" true
+    (contains_substring c_code "if ((void\\*)__arrow_access_.* <= __data_end)");
+  check bool "Packet dereference should not use raw SAFE_DEREF" false
+    (contains_substring c_code "SAFE_DEREF(__arrow_access_")
+
 let test_tc_context_field_types () =
   let source = {|
     @tc("ingress") fn test_tc_context_fields(ctx: *__sk_buff) -> tc_action {
@@ -255,6 +281,7 @@ let () =
     ("XDP context field types", [
       test_case "XDP context field types are correct" `Quick test_xdp_context_field_types;
       test_case "Context field arithmetic works" `Quick test_context_field_arithmetic;
+      test_case "XDP packet dereference is bounds guarded" `Quick test_xdp_packet_deref_bounds_guard;
       test_case "XDP context field pointer preservation" `Quick test_xdp_context_field_pointer_preservation;
       test_case "Rate limiter type reproduction" `Quick test_exact_rate_limiter_reproduction;
     ]);
