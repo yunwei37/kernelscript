@@ -277,12 +277,18 @@ let test_ebpf_struct_ops_codegen () =
   (* Check for struct_ops section annotations *)
   check bool "Contains struct_ops sections" true
     (try ignore (Str.search_forward (Str.regexp "SEC(\"struct_ops") c_code 0); true with Not_found -> false);
+  check bool "Contains tracing include for struct_ops wrappers" true
+    (contains_substr c_code "#include <bpf/bpf_tracing.h>");
+  check bool "Contains struct_ops BPF_PROG wrapper" true
+    (contains_substr c_code "BPF_PROG(__ks_struct_ops_init");
   
   (* Kernel struct definitions from .kh headers should NOT be emitted (vmlinux.h provides them) *)
 
   (* Check that struct_ops instance is properly generated *)
   check bool "Contains struct_ops instance definition" true
     (try ignore (Str.search_forward (Str.regexp "SEC(\"\\.struct_ops\")") c_code 0); true with Not_found -> false);
+  check bool "Struct_ops map points at wrapper entry" true
+    (contains_substr c_code ".init = (void *)__ks_struct_ops_init");
   check bool "Instance has correct struct type" true
     (try ignore (Str.search_forward (Str.regexp "struct tcp_congestion_ops.*MyTcpCong") c_code 0); true with Not_found -> false)
 
@@ -954,6 +960,8 @@ let test_struct_ops_internal_calls_are_direct () =
 
   check bool "struct_ops direct call emitted" true
     (contains_substr c_code "ssthresh(sk)");
+  check bool "struct_ops map uses wrapper for called function" true
+    (contains_substr c_code ".ssthresh = (void *)__ks_struct_ops_ssthresh");
   check bool "struct_ops tail call not emitted" false
     (contains_substr c_code "bpf_tail_call(ctx, &prog_array")
 
@@ -1256,11 +1264,11 @@ let test_sched_ext_ops_ebpf_codegen () =
     (try ignore (Str.search_forward (Str.regexp "struct sched_ext_ops.*priority_scheduler") c_code 0); true with Not_found -> false)
 
 (** Test that a struct_ops method named after a clang builtin (e.g. sched_ext_ops
-    has an `exit` member) is emitted verbatim - same C symbol, SEC() suffix and
-    instance member. clang would otherwise treat `exit` as the `noreturn` builtin
-    and miscompile the body to an empty section; that is handled at build time by
-    `-fno-builtin` in the generated Makefile's BPF_CFLAGS, not by mangling the
-    name here. This test guards against the codegen reintroducing a rename. *)
+    has an `exit` member) keeps the typed helper name verbatim while the
+    verifier-visible struct_ops entry uses the generated wrapper. clang would
+    otherwise treat `exit` as the `noreturn` builtin and miscompile the body to
+    an empty section; that is handled at build time by `-fno-builtin` in the
+    generated Makefile's BPF_CFLAGS, not by mangling the typed helper name. *)
 let test_struct_ops_builtin_method_name_emitted_verbatim () =
   let program = {|
     @struct_ops("sched_ext_ops")
@@ -1292,15 +1300,15 @@ let test_struct_ops_builtin_method_name_emitted_verbatim () =
   let ir = Ir_generator.generate_ir typed_ast symbol_table "test" in
   let (c_code, _) = Ebpf_c_codegen.compile_multi_to_c_with_analysis ir in
 
-  (* The `exit` method is emitted verbatim - not renamed/mangled *)
-  check bool "exit method emitted as bare `void exit(`" true
+  (* The typed `exit` helper is emitted verbatim for internal calls. *)
+  check bool "exit method emitted as bare typed helper" true
     (contains_substr c_code "void exit(");
   check bool "SEC uses the verbatim member name" true
     (contains_substr c_code "SEC(\"struct_ops/exit\")");
-  check bool "struct_ops instance wires .exit to the exit symbol" true
-    (contains_substr c_code ".exit = (void *)exit,");
-  (* Non-builtin names are likewise untouched *)
-  check bool "non-builtin method select_cpu unchanged" true
+  check bool "struct_ops instance wires .exit to the wrapper symbol" true
+    (contains_substr c_code ".exit = (void *)__ks_struct_ops_exit,");
+  (* Non-builtin typed helper names are likewise untouched. *)
+  check bool "non-builtin typed helper select_cpu unchanged" true
     (contains_substr c_code "select_cpu(__u8* p")
 
 (** Test sched_ext_ops registry functionality *)
@@ -1478,4 +1486,4 @@ let tests = [
 
 let () = Alcotest.run "KernelScript struct_ops and BTF integration tests" [
   "struct_ops_tests", tests
-] 
+]

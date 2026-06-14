@@ -243,6 +243,9 @@ let add_include ctx include_name =
   if not (List.mem include_name ctx.includes) then
     ctx.includes <- include_name :: ctx.includes
 
+let struct_ops_wrapper_name func_name =
+  "__ks_struct_ops_" ^ func_name
+
 let fresh_var ctx prefix =
   ctx.var_counter <- ctx.var_counter + 1;
   sprintf "%s_%d" prefix ctx.var_counter
@@ -912,6 +915,25 @@ let generate_includes ctx ?(program_types=[]) ?(ir_multi_prog=None) ?(ir_program
         acc @ includes
     | None -> acc
   ) [] program_types in
+
+  let has_struct_ops = match ir_multi_prog with
+    | Some multi_prog ->
+        Ir.get_struct_ops_instances multi_prog <> [] ||
+        List.exists (fun source_decl ->
+          match source_decl.Ir.decl_desc with
+          | IRDeclFunctionDef func_def ->
+              (match func_def.func_program_type with Some Ast.StructOps -> true | _ -> false)
+          | IRDeclProgramDef program ->
+              (match program.entry_function.func_program_type with Some Ast.StructOps -> true | _ -> false)
+          | _ -> false
+        ) multi_prog.Ir.source_declarations
+    | None ->
+        List.exists (function Ast.StructOps -> true | _ -> false) program_types
+  in
+  let context_includes =
+    if has_struct_ops then context_includes @ ["#include <bpf/bpf_tracing.h>"]
+    else context_includes
+  in
   
   (* Remove duplicates between all include sets *)
   let all_base_includes = vmlinux_includes @ standard_includes in
@@ -1122,8 +1144,10 @@ let generate_struct_ops ctx ir_multi_program =
     List.iter (fun (field_name, field_value) ->
       match field_value.value_desc with
       | IRFunctionRef func_name ->
-          (* Function reference - use void pointer cast *)
-          emit_line ctx (sprintf ".%s = (void *)%s," field_name func_name)
+          (* Struct_ops maps point at the verifier-visible wrapper entry point.
+             The original function name remains a typed helper for internal
+             calls from other struct_ops methods. *)
+          emit_line ctx (sprintf ".%s = (void *)%s," field_name (struct_ops_wrapper_name func_name))
       | IRLiteral (StringLit s) ->
           (* String literal - use direct assignment *)
           emit_line ctx (sprintf ".%s = \"%s\"," field_name (escape_c_string s))
@@ -1891,11 +1915,40 @@ let rec generate_c_function ctx ir_func =
              sprintf "%s %s" (ebpf_type_from_ir_type param_type) name
            ) ir_func.parameters)
   in
+
+  let is_struct_ops_function =
+    match ir_func.func_program_type with Some Ast.StructOps -> true | _ -> false
+  in
+
+  let emit_struct_ops_wrapper () =
+    let wrapper_name = struct_ops_wrapper_name ir_func.func_name in
+    let wrapper_params =
+      if params_str = "" then
+        sprintf "%s BPF_PROG(%s)" return_type_str wrapper_name
+      else
+        sprintf "%s BPF_PROG(%s, %s)" return_type_str wrapper_name params_str
+    in
+    let arg_names = List.map fst ir_func.parameters in
+    let call = sprintf "%s(%s)" ir_func.func_name (String.concat ", " arg_names) in
+    emit_line ctx (sprintf "static __always_inline %s %s(%s);" return_type_str ir_func.func_name params_str);
+    emit_line ctx (sprintf "SEC(\"struct_ops/%s\")" ir_func.func_name);
+    emit_line ctx wrapper_params;
+    emit_line ctx "{";
+    increase_indent ctx;
+    if return_type_str = "void" then (
+      emit_line ctx (call ^ ";")
+    ) else (
+      emit_line ctx (sprintf "return %s;" call)
+    );
+    decrease_indent ctx;
+    emit_line ctx "}";
+    emit_blank_line ctx
+  in
   
   let section_attr = 
     (* Check if this is a struct_ops function first *)
     match ir_func.func_program_type with
-    | Some Ast.StructOps -> sprintf "SEC(\"struct_ops/%s\")" ir_func.func_name  (* struct_ops functions use their name in the section *)
+    | Some Ast.StructOps -> ""  (* wrappers carry the struct_ops section *)
     | _ ->
         (* Generate section name using context-specific modules for all other cases *)
         if ir_func.is_main then
@@ -1927,7 +1980,10 @@ let rec generate_c_function ctx ir_func =
         else ""
   in
   
-  emit_line ctx section_attr;
+  if is_struct_ops_function then
+    emit_struct_ops_wrapper ();
+  if section_attr <> "" then
+    emit_line ctx section_attr;
   
   (* Try to generate custom function signature through context codegen system *)
   let context_type = match ir_func.func_program_type with
@@ -1953,7 +2009,8 @@ let rec generate_c_function ctx ir_func =
        emit_line ctx "{";
         | None -> 
        (* Regular function signature for standard functions *)
-       emit_line ctx (sprintf "%s %s(%s) {" return_type_str ir_func.func_name params_str));
+       let func_prefix = if is_struct_ops_function then "static __always_inline " else "" in
+       emit_line ctx (sprintf "%s%s %s(%s) {" func_prefix return_type_str ir_func.func_name params_str));
   
   increase_indent ctx;
   
