@@ -6,7 +6,6 @@ include "sched_ext_ops.kh"
 // kfuncs declarations (signatures match the kernel BTF for sched_ext)
 extern scx_bpf_select_cpu_dfl(p: *task_struct, prev_cpu: i32, wake_flags: u64, is_idle: *bool) -> i32
 extern scx_bpf_dsq_insert(p: *task_struct, dsq_id: u64, slice: u64, enq_flags: u64) -> void
-extern scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool
 
 // Simple FIFO scheduler implementation
 @struct_ops("sched_ext_ops")
@@ -32,12 +31,10 @@ impl simple_fifo_scheduler {
         scx_bpf_dsq_insert(p, SCX_DSQ_GLOBAL, SCX_SLICE_DFL, enq_flags)
     }
     
-    // Dispatch tasks from global queue to local CPU
+    // Dispatch callback
     fn dispatch(cpu: i32, prev: *task_struct) -> void {
-        // Try to move a task from the global DSQ to this CPU's local DSQ
-        if (!scx_bpf_dsq_move_to_local(SCX_DSQ_GLOBAL)) {
-            // No tasks available, CPU will go idle
-        }
+        // enqueue() uses the built-in global DSQ. sched_ext automatically
+        // falls back to that DSQ after dispatch() returns.
     }
     
     // Task becomes runnable
@@ -94,8 +91,8 @@ impl simple_fifo_scheduler {
     // Scheduler name
     name: "simple_fifo",
     
-    // Timeout in milliseconds (0 = no timeout)
-    timeout_ms: 0,
+    // Timeout in milliseconds
+    timeout_ms: 1000,
     
     // Scheduler flags
     flags: 0,
